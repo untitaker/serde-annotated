@@ -1,0 +1,11 @@
+[package]
+name = "serde-annotated"
+version = "0.1.0"
+authors = ["Markus Unterwaditzer <markus@unterwaditzer.net>"]
+
+[dependencies]
+serde = "1.0.79"
+serde_json = "1.0.32"
+
+[dev-dependencies]
+serde_derive = "1.0.79"
