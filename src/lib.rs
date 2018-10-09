@@ -1,27 +1,39 @@
-#[cfg(test)] #[macro_use] extern crate serde_derive;
+#[macro_use] extern crate serde_derive;
 
 extern crate serde;
 #[macro_use] extern crate serde_json;
 
-use serde_json::value::Value;
-use serde_json::Map;
+use std::collections::BTreeMap;
+
 use serde::de::{Deserialize, Deserializer};
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Value<'a> {
+    WithMeta {
+        #[serde(rename = "_meta")]
+        meta_map: BTreeMap<String, &'a serde_json::value::RawValue>,
+        #[serde(flatten)]
+        #[serde(borrow)]
+        value: SubValue<'a>
+    },
+    Arbitrary(&'a serde_json::value::RawValue)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SubValue<'a> {
+    #[serde(borrow)]
+    Array(Vec<Value<'a>>),
+    #[serde(borrow)]
+    Map(BTreeMap<String, Value<'a>>),
+    #[serde(borrow)]
+    Arbitrary(&'a serde_json::value::RawValue)
+}
 
 pub struct Annotated<V, M> {
     value: V,
     meta: M
-}
-
-fn append_path(path: &str, segment: &str) -> String {
-    if path == "" || path == "." {
-        return segment.to_owned();
-    }
-
-    if segment == "" || segment == "." {
-        return path.to_owned();
-    }
-
-    format!("{}.{}", path, segment)
 }
 
 fn deserialize_from_value<'de, T, D: Deserializer<'de>>(value: serde_json::Value)
@@ -36,16 +48,15 @@ where for <'de2> V: Deserialize<'de2>,
       for <'de2> M: Deserialize<'de2> + Default,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: Value = Deserialize::deserialize(deserializer)?;
+        let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
 
-        if let Value::Object(mut obj) = value {
-            let mut meta_map: Map<String, Value> = match obj.remove("_meta") {
+        if let serde_json::Value::Object(mut obj) = value {
+            let mut meta_map: serde_json::Map<String, serde_json::Value> = match obj.remove("_meta") {
                 Some(x) => deserialize_from_value::<_, D>(x)?,
                 None => Default::default()
             };
-
-            let value = match obj.remove("_value").unwrap_or(Value::Object(obj)) {
-                Value::Object(obj) => Value::Object(obj.into_iter()
+            let value = match obj.remove("_value").unwrap_or(serde_json::Value::Object(obj)) {
+                serde_json::Value::Object(obj) => serde_json::Value::Object(obj.into_iter()
                     .map(|(key, value)| {
                         let value = json!({
                             "_meta": meta_map.remove(&key).unwrap_or_else(|| json!({})),
@@ -54,7 +65,7 @@ where for <'de2> V: Deserialize<'de2>,
                         (key, value)
                     })
                     .collect()),
-                Value::Array(arr) => Value::Array(arr.into_iter()
+                serde_json::Value::Array(arr) => serde_json::Value::Array(arr.into_iter()
                     .enumerate()
                     .map(|(i, value)| {
                         json!({
