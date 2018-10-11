@@ -21,13 +21,13 @@ struct OpaqueValue(serde_json::Value);
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ValueWithMeta<V, M> {
-    ExplicitMeta {
+    Explicit {
         #[serde(rename = "_meta")]
         meta_map: M,
         #[serde(rename = "_value")]
         value: V,
     },
-    InlineMeta {
+    Inline {
         #[serde(rename = "_meta")]
         meta_map: M,
         #[serde(flatten)]
@@ -36,24 +36,21 @@ enum ValueWithMeta<V, M> {
     NoMeta(V),
 }
 
-use ValueWithMeta::*;
-
 impl<V, M> ValueWithMeta<V, M> {
     #[inline]
     fn new(value: V, meta: Option<M>) -> Self {
         match meta {
-            Some(meta_map) => ExplicitMeta { meta_map, value },
-            None => NoMeta(value),
+            Some(meta_map) => ValueWithMeta::Explicit { meta_map, value },
+            None => ValueWithMeta::NoMeta(value),
         }
     }
 
     #[inline]
     fn into_tuple(self) -> (V, Option<M>) {
         match self {
-            ExplicitMeta { value, meta_map } | InlineMeta { value, meta_map } => {
-                (value, Some(meta_map))
-            }
-            NoMeta(value) => (value, None),
+            ValueWithMeta::Explicit { value, meta_map }
+            | ValueWithMeta::Inline { value, meta_map } => (value, Some(meta_map)),
+            ValueWithMeta::NoMeta(value) => (value, None),
         }
     }
 
@@ -99,11 +96,11 @@ where
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value: ShallowValueWithMeta = Deserialize::deserialize(deserializer)?;
         match value {
-            InlineMeta {
+            ValueWithMeta::Inline {
                 mut meta_map,
                 value,
             }
-            | ExplicitMeta {
+            | ValueWithMeta::Explicit {
                 mut meta_map,
                 value,
             } => {
@@ -197,15 +194,9 @@ where
         let value_with_meta = if meta_map.is_empty() {
             ValueWithMeta::NoMeta(value)
         } else if as_inline {
-            ValueWithMeta::InlineMeta {
-                meta_map: meta_map,
-                value: value,
-            }
+            ValueWithMeta::Inline { meta_map, value }
         } else {
-            ValueWithMeta::ExplicitMeta {
-                meta_map: meta_map,
-                value: value,
-            }
+            ValueWithMeta::Explicit { meta_map, value }
         };
 
         Serialize::serialize(&value_with_meta, serializer)
