@@ -1,65 +1,66 @@
 #[macro_use] extern crate serde_derive;
 
 extern crate serde;
-#[macro_use] extern crate serde_json;
+#[cfg(test)] #[macro_use] extern crate serde_json;
+#[cfg(not(test))] extern crate serde_json;
 
 use std::collections::BTreeMap;
 
 use serde::ser::Serialize;
 use serde::de::{Deserialize, Deserializer};
 
-#[derive(Deserialize, Serialize)]
+/// Substitution for serde_json::RawValue, TODO: replace this type once RawValue actually works
+/// https://github.com/serde-rs/json/issues/497
+#[derive(Debug, Deserialize, Serialize)]
+struct OpaqueValue(serde_json::Value);
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
-enum Value<'a> {
-    WithMeta {
+enum ValueWithMeta<V, M> {
+    ExplicitMeta {
         #[serde(rename = "_meta")]
-        meta_map: BTreeMap<String, &'a serde_json::value::RawValue>,
-        #[serde(flatten)]
-        #[serde(borrow)]
-        value: SubValue<'a>
+        meta_map: M,
+        #[serde(rename = "_value")]
+        value: V
     },
-    Arbitrary(#[serde(borrow)] &'a serde_json::value::RawValue)
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-enum SubValue<'a> {
-    #[serde(borrow)]
-    Array(Vec<SubSubValue<'a>>),
-    #[serde(borrow)]
-    Map(BTreeMap<String, SubSubValue<'a>>),
-    #[serde(borrow)]
-    Arbitrary(&'a serde_json::value::RawValue)
-}
-
-
-#[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-enum SubSubValue<'a> {
-    WithMeta {
+    InlineMeta {
         #[serde(rename = "_meta")]
-        #[serde(borrow)]
-        meta: &'a serde_json::value::RawValue,
+        meta_map: M,
         #[serde(flatten)]
-        #[serde(borrow)]
-        value: &'a serde_json::value::RawValue
+        value: V
     },
-    Arbitrary(&'a serde_json::value::RawValue)
+    NoMeta(V)
 }
 
-impl<'a> SubSubValue<'a> {
-    fn with_meta(self, meta: Option<&'a serde_json::value::RawValue>) -> Self {
+use ValueWithMeta::*;
+
+impl<V, M> ValueWithMeta<V, M> {
+    fn with_meta(self, meta: Option<M>) -> Self {
         let value = match self {
-            SubSubValue::WithMeta { value, .. } => value,
-            SubSubValue::Arbitrary(value) => value
+            ExplicitMeta { value, .. } | InlineMeta { value, .. } | NoMeta(value) => value
         };
 
         match meta {
-            Some(meta) => SubSubValue::WithMeta { meta, value },
-            None => SubSubValue::Arbitrary(value)
+            Some(meta_map) => ExplicitMeta { meta_map, value },
+            None => NoMeta(value)
         }
     }
 }
+
+/// Holds a value with metadata, where the topmost level of the metadata is rearrangable but
+/// everything further below is opaque (unparsed)
+type ShallowValueWithMeta = ValueWithMeta<ShallowValue, BTreeMap<String, OpaqueValue>>;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ShallowValue {
+    Array(Vec<OpaqueValueWithMeta>),
+    Map(BTreeMap<String, OpaqueValueWithMeta>),
+    // We would want to use RawValue here but it does not matter much in terms of performance
+    Primitive(OpaqueValue)
+}
+
+type OpaqueValueWithMeta = ValueWithMeta<OpaqueValue, OpaqueValue>;
 
 fn coerce_over_json<A, B>(source: &A) -> Result<B, serde_json::Error> 
 where A: Serialize,
@@ -78,39 +79,42 @@ where for <'de2> V: Deserialize<'de2>,
       for <'de2> M: Deserialize<'de2> + Default,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: Value = Deserialize::deserialize(deserializer)?;
+        let value: ShallowValueWithMeta = Deserialize::deserialize(deserializer)?;
+        match value {
+            InlineMeta { mut meta_map, value } | ExplicitMeta { mut meta_map, value } => {
+                let value = match value {
+                    ShallowValue::Map(obj) => ShallowValue::Map(obj.into_iter()
+                        .map(|(key, value)| {
+                            let value = value.with_meta(meta_map.remove(&key));
+                            (key, value)
+                        })
+                        .collect()),
+                    ShallowValue::Array(arr) => ShallowValue::Array(arr.into_iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            value.with_meta(meta_map.remove(&format!("{}", i)))
+                        })
+                        .collect()),
+                    primitive => primitive
+                };
 
-        if let Value::WithMeta { mut meta_map, value } = value {
-            let value = match value {
-                SubValue::Map(obj) => SubValue::Map(obj.into_iter()
-                    .map(|(key, value)| {
-                        let value = value.with_meta(meta_map.remove(&key));
-                        (key, value)
-                    })
-                    .collect()),
-                SubValue::Array(arr) => SubValue::Array(arr.into_iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        value.with_meta(meta_map.remove(&format!("{}", i)))
-                    })
-                    .collect()),
-                primitive => primitive
-            };
 
-            let meta = match meta_map.remove("") {
-                Some(x) => coerce_over_json(&x).map_err(serde::de::Error::custom)?,
-                None => Default::default()
-            };
+                let meta = match meta_map.remove("") {
+                    Some(x) => coerce_over_json(&x).map_err(serde::de::Error::custom)?,
+                    None => Default::default()
+                };
 
-            Ok(Annotated {
-                value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
-                meta
-            })
-        } else {
-            Ok(Annotated {
-                value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
-                meta: Default::default()
-            })
+                Ok(Annotated {
+                    value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
+                    meta
+                })
+            },
+            value => {
+                Ok(Annotated {
+                    value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
+                    meta: Default::default()
+                })
+            }
         }
     }
 }
@@ -118,7 +122,21 @@ where for <'de2> V: Deserialize<'de2>,
 #[cfg(test)]
 mod test_deserialize {
     use serde_json;
-    use super::Annotated;
+    use serde::de::{Deserialize};
+    use super::{Annotated, ShallowValueWithMeta, ShallowValue, OpaqueValueWithMeta, OpaqueValue};
+
+    #[test]
+    fn value_input() {
+        fn inner<T>() where for<'de> T: Deserialize<'de> {
+            let _: T = serde_json::from_value(json!(42)).unwrap();
+            let _: T = serde_json::from_value(json!({"_meta": 42, "foo": "bar"})).unwrap();
+        }
+
+        inner::<ShallowValueWithMeta>();
+        inner::<ShallowValue>();
+        inner::<OpaqueValueWithMeta>();
+        inner::<OpaqueValue>();
+    }
 
     #[test]
     fn basics() {
