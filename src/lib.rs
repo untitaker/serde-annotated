@@ -6,7 +6,7 @@ extern crate serde;
 
 use std::collections::BTreeMap;
 
-use serde::ser::Serialize;
+use serde::ser::{Serialize, Serializer};
 use serde::de::{Deserialize, Deserializer};
 
 /// Substitution for serde_json::RawValue, TODO: replace this type once RawValue actually works
@@ -35,15 +35,25 @@ enum ValueWithMeta<V, M> {
 use ValueWithMeta::*;
 
 impl<V, M> ValueWithMeta<V, M> {
-    fn with_meta(self, meta: Option<M>) -> Self {
-        let value = match self {
-            ExplicitMeta { value, .. } | InlineMeta { value, .. } | NoMeta(value) => value
-        };
-
+    #[inline]
+    fn new(value: V, meta: Option<M>) -> Self {
         match meta {
             Some(meta_map) => ExplicitMeta { meta_map, value },
             None => NoMeta(value)
         }
+    }
+
+    #[inline]
+    fn into_tuple(self) -> (V, Option<M>) {
+        match self {
+            ExplicitMeta { value, meta_map } | InlineMeta { value, meta_map } => (value, Some(meta_map)),
+            NoMeta(value) => (value, None)
+        }
+    }
+
+    fn with_meta(self, meta: Option<M>) -> Self {
+        let (value, _) = self.into_tuple();
+        Self::new(value, meta)
     }
 }
 
@@ -84,15 +94,15 @@ where for <'de2> V: Deserialize<'de2>,
             InlineMeta { mut meta_map, value } | ExplicitMeta { mut meta_map, value } => {
                 let value = match value {
                     ShallowValue::Map(obj) => ShallowValue::Map(obj.into_iter()
-                        .map(|(key, value)| {
-                            let value = value.with_meta(meta_map.remove(&key));
-                            (key, value)
+                        .map(|(key, mut value_with_meta)| {
+                            value_with_meta = value_with_meta.with_meta(meta_map.remove(&key));
+                            (key, value_with_meta)
                         })
                         .collect()),
                     ShallowValue::Array(arr) => ShallowValue::Array(arr.into_iter()
                         .enumerate()
-                        .map(|(i, value)| {
-                            value.with_meta(meta_map.remove(&format!("{}", i)))
+                        .map(|(i, value_with_meta)| {
+                            value_with_meta.with_meta(meta_map.remove(&format!("{}", i)))
                         })
                         .collect()),
                     primitive => primitive
@@ -116,6 +126,61 @@ where for <'de2> V: Deserialize<'de2>,
                 })
             }
         }
+    }
+}
+
+impl<V, M> Serialize for Annotated<V, M> 
+where V: Serialize,
+      M: Serialize + PartialEq + Default
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value: ShallowValue = coerce_over_json(&self.value).map_err(serde::ser::Error::custom)?;
+        let mut meta_map: BTreeMap<String, OpaqueValue> = BTreeMap::new();
+        if self.meta != Default::default() {
+            meta_map.insert("".to_owned(), coerce_over_json(&self.meta).map_err(serde::ser::Error::custom)?);
+        }
+
+        let (as_inline, value) = match value {
+            ShallowValue::Map(obj) => (true, ShallowValue::Map({
+                obj.into_iter().map(|(key, value_with_meta)| {
+                    let (value, meta) = value_with_meta.into_tuple();
+                    if let Some(meta) = meta {
+                        meta_map.insert(key.clone(), meta);
+                    }
+                    (key, ValueWithMeta::NoMeta(value))
+                }).collect()
+            })),
+            ShallowValue::Array(arr) => (false, ShallowValue::Array({
+                arr.into_iter().enumerate().map(|(i, value_with_meta)| {
+                    let (value, meta) = value_with_meta.into_tuple();
+                    if let Some(meta) = meta {
+                        meta_map.insert(format!("{}", i), meta);
+                    };
+
+                    ValueWithMeta::NoMeta(value)
+                }).collect()
+            })),
+            primitive => (false, primitive)
+        };
+
+        let value_with_meta = if meta_map.is_empty() {
+            ValueWithMeta::NoMeta(value)
+        } else if as_inline {
+            ValueWithMeta::InlineMeta {
+                meta_map: meta_map,
+                value: value
+            }
+        } else {
+            ValueWithMeta::ExplicitMeta {
+                meta_map: meta_map,
+                value: value
+            }
+        };
+
+        Serialize::serialize(&value_with_meta, serializer)
     }
 }
 
@@ -163,3 +228,41 @@ mod test_deserialize {
         assert_eq!(event.value.foo.meta.meta_foo, Some(42));
     }
 } 
+
+#[cfg(test)]
+mod test_serialize {
+    use serde_json;
+    use super::Annotated;
+
+    #[test]
+    fn basics() {
+        #[derive(Serialize, Default, PartialEq)]
+        struct Meta {
+            meta_foo: Option<usize>
+        }
+
+        #[derive(Serialize)]
+        struct Event {
+            foo: Annotated<usize, Meta>
+        }
+
+        let event = Annotated {
+            value: Event {
+                foo: Annotated {
+                    value: 69,
+                    meta: Meta { meta_foo: Some(42) }
+                }
+            },
+            meta: Meta { meta_foo: Some(420) }
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value, json!({
+            "_meta": {
+                "": {"meta_foo": 420},
+                "foo": {"": {"meta_foo": 42}},
+            },
+            "foo": 69
+        }));
+    }
+}
