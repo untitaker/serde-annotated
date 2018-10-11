@@ -22,16 +22,20 @@ struct OpaqueValue(serde_json::Value);
 #[serde(untagged)]
 enum ValueWithMeta<V, M> {
     Explicit {
-        #[serde(rename = "_meta")]
-        meta_map: M,
-        #[serde(rename = "_value")]
+        // This format is used to communicate data between Annotated<..> layers when the value is
+        // not a map.
+        #[serde(rename = "__serde_annotated_value")]
         value: V,
+        #[serde(rename = "__serde_annotated_meta")]
+        meta: Option<M>,
+        #[serde(rename = "__serde_annotated_path")]
+        path: Option<String>,
     },
     Inline {
-        #[serde(rename = "_meta")]
-        meta_map: M,
         #[serde(flatten)]
         value: V,
+        #[serde(rename = "_meta")]
+        meta: M,
     },
     NoMeta(V),
 }
@@ -40,23 +44,36 @@ impl<V, M> ValueWithMeta<V, M> {
     #[inline]
     fn new(value: V, meta: Option<M>) -> Self {
         match meta {
-            Some(meta_map) => ValueWithMeta::Explicit { meta_map, value },
+            Some(meta) => ValueWithMeta::Explicit {
+                meta: Some(meta),
+                value,
+                path: None,
+            },
             None => ValueWithMeta::NoMeta(value),
         }
     }
 
     #[inline]
-    fn into_tuple(self) -> (V, Option<M>) {
+    fn into_tuple(self) -> (V, Option<M>, Option<String>) {
         match self {
-            ValueWithMeta::Explicit { value, meta_map }
-            | ValueWithMeta::Inline { value, meta_map } => (value, Some(meta_map)),
-            ValueWithMeta::NoMeta(value) => (value, None),
+            ValueWithMeta::Explicit { value, meta, path } => (value, meta, path),
+            ValueWithMeta::Inline { value, meta } => (value, Some(meta), None),
+            ValueWithMeta::NoMeta(value) => (value, None, None),
         }
     }
 
     fn with_meta(self, meta: Option<M>) -> Self {
-        let (value, _) = self.into_tuple();
+        let (value, _, _) = self.into_tuple();
         Self::new(value, meta)
+    }
+
+    fn with_path(self, path: String) -> Self {
+        let (value, meta, _) = self.into_tuple();
+        ValueWithMeta::Explicit {
+            value,
+            meta,
+            path: Some(path),
+        }
     }
 }
 
@@ -88,55 +105,77 @@ pub struct Annotated<V, M> {
     meta: M,
 }
 
+impl<V, M> Annotated<V, M> {
+    pub fn new(value: V, meta: M) -> Self {
+        Annotated { value, meta }
+    }
+}
+
+pub trait SetPath {
+    fn set_path(&mut self, path: String) {
+        let _path = path;
+    }
+}
+
+fn append_path(mut path: String, segment: &str) -> String {
+    if path.is_empty() || path == "." {
+        return segment.to_owned();
+    }
+
+    path.push_str(".");
+    path.push_str(segment);
+    path
+}
+
 impl<'de, V, M> Deserialize<'de> for Annotated<V, M>
 where
     for<'de2> V: Deserialize<'de2>,
-    for<'de2> M: Deserialize<'de2> + Default,
+    for<'de2> M: Deserialize<'de2> + Default + SetPath,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value: ShallowValueWithMeta = Deserialize::deserialize(deserializer)?;
-        match value {
-            ValueWithMeta::Inline {
-                mut meta_map,
-                value,
-            }
-            | ValueWithMeta::Explicit {
-                mut meta_map,
-                value,
-            } => {
-                let value = match value {
-                    ShallowValue::Map(obj) => ShallowValue::Map(
-                        obj.into_iter()
-                            .map(|(key, mut value_with_meta)| {
-                                value_with_meta = value_with_meta.with_meta(meta_map.remove(&key));
-                                (key, value_with_meta)
-                            }).collect(),
-                    ),
-                    ShallowValue::Array(arr) => ShallowValue::Array(
-                        arr.into_iter()
-                            .enumerate()
-                            .map(|(i, value_with_meta)| {
-                                value_with_meta.with_meta(meta_map.remove(&format!("{}", i)))
-                            }).collect(),
-                    ),
-                    primitive => primitive,
-                };
+        let value_with_meta: ShallowValueWithMeta = Deserialize::deserialize(deserializer)?;
+        let (value, mut meta, path) = value_with_meta.into_tuple();
+        let path = path.unwrap_or_else(|| ".".to_owned());
 
-                let meta = match meta_map.remove("") {
-                    Some(x) => coerce_over_json(&x).map_err(serde::de::Error::custom)?,
-                    None => Default::default(),
-                };
+        let value = match value {
+            ShallowValue::Map(obj) => ShallowValue::Map(
+                obj.into_iter()
+                    .map(|(key, mut value_with_meta)| {
+                        if let Some(ref mut meta) = meta {
+                            value_with_meta = value_with_meta.with_meta(meta.remove(&key));
+                        }
+                        value_with_meta =
+                            value_with_meta.with_path(append_path(path.clone(), &key));
+                        (key, value_with_meta)
+                    }).collect(),
+            ),
+            ShallowValue::Array(arr) => ShallowValue::Array(
+                arr.into_iter()
+                    .enumerate()
+                    .map(|(i, mut value_with_meta)| {
+                        let key = format!("{}", i);
+                        if let Some(ref mut meta) = meta {
+                            value_with_meta = value_with_meta.with_meta(meta.remove(&key));
+                        }
+                        value_with_meta =
+                            value_with_meta.with_path(append_path(path.clone(), &key));
+                        value_with_meta
+                    }).collect(),
+            ),
+            primitive => primitive,
+        };
 
-                Ok(Annotated {
-                    value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
-                    meta,
-                })
-            }
-            value => Ok(Annotated {
-                value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
-                meta: Default::default(),
-            }),
-        }
+        let mut meta_structured: M = match meta.as_mut().and_then(|map| map.remove("")) {
+            Some(x) => coerce_over_json(&x).map_err(serde::de::Error::custom)?,
+            None => Default::default(),
+        };
+
+        meta_structured.set_path(path);
+
+        Ok(Annotated {
+            value: coerce_over_json(&value).map_err(serde::de::Error::custom)?,
+            meta: meta_structured,
+        })
     }
 }
 
@@ -151,9 +190,9 @@ where
     {
         let value: ShallowValue =
             coerce_over_json(&self.value).map_err(serde::ser::Error::custom)?;
-        let mut meta_map: BTreeMap<String, OpaqueValue> = BTreeMap::new();
+        let mut meta: BTreeMap<String, OpaqueValue> = BTreeMap::new();
         if self.meta != Default::default() {
-            meta_map.insert(
+            meta.insert(
                 "".to_owned(),
                 coerce_over_json(&self.meta).map_err(serde::ser::Error::custom)?,
             );
@@ -165,9 +204,9 @@ where
                 ShallowValue::Map({
                     obj.into_iter()
                         .map(|(key, value_with_meta)| {
-                            let (value, meta) = value_with_meta.into_tuple();
-                            if let Some(meta) = meta {
-                                meta_map.insert(key.clone(), meta);
+                            let (value, m, _) = value_with_meta.into_tuple();
+                            if let Some(m) = m {
+                                meta.insert(key.clone(), m);
                             }
                             (key, ValueWithMeta::NoMeta(value))
                         }).collect()
@@ -179,9 +218,9 @@ where
                     arr.into_iter()
                         .enumerate()
                         .map(|(i, value_with_meta)| {
-                            let (value, meta) = value_with_meta.into_tuple();
-                            if let Some(meta) = meta {
-                                meta_map.insert(format!("{}", i), meta);
+                            let (value, m, _) = value_with_meta.into_tuple();
+                            if let Some(m) = m {
+                                meta.insert(format!("{}", i), m);
                             };
 
                             ValueWithMeta::NoMeta(value)
@@ -191,12 +230,16 @@ where
             primitive => (false, primitive),
         };
 
-        let value_with_meta = if meta_map.is_empty() {
+        let value_with_meta = if meta.is_empty() {
             ValueWithMeta::NoMeta(value)
         } else if as_inline {
-            ValueWithMeta::Inline { meta_map, value }
+            ValueWithMeta::Inline { meta, value }
         } else {
-            ValueWithMeta::Explicit { meta_map, value }
+            ValueWithMeta::Explicit {
+                meta: Some(meta),
+                value,
+                path: None,
+            }
         };
 
         Serialize::serialize(&value_with_meta, serializer)
@@ -205,7 +248,9 @@ where
 
 #[cfg(test)]
 mod test_deserialize {
-    use super::{Annotated, OpaqueValue, OpaqueValueWithMeta, ShallowValue, ShallowValueWithMeta};
+    use super::{
+        Annotated, OpaqueValue, OpaqueValueWithMeta, SetPath, ShallowValue, ShallowValueWithMeta,
+    };
     use serde::de::Deserialize;
     use serde_json;
 
@@ -230,6 +275,13 @@ mod test_deserialize {
         #[derive(Deserialize, Default)]
         struct Meta {
             meta_foo: Option<usize>,
+            path: Option<String>,
+        }
+
+        impl SetPath for Meta {
+            fn set_path(&mut self, path: String) {
+                self.path = Some(path)
+            }
         }
 
         #[derive(Deserialize)]
@@ -248,6 +300,9 @@ mod test_deserialize {
         assert_eq!(event.value.foo.value, 69);
         assert_eq!(event.meta.meta_foo, Some(420));
         assert_eq!(event.value.foo.meta.meta_foo, Some(42));
+
+        assert_eq!(event.meta.path, Some(".".to_owned()));
+        assert_eq!(event.value.foo.meta.path, Some("foo".to_owned()));
     }
 }
 

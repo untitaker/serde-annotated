@@ -15,6 +15,8 @@ struct Meta {
     foo_meta: Option<usize>,
 }
 
+impl serde_annotated::SetPath for Meta {}
+
 type Annotated<T> = serde_annotated::Annotated<T, Meta>;
 
 #[derive(Serialize, Deserialize)]
