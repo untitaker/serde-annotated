@@ -10,7 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 
-#[derive(Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct Meta {
     foo_meta: Option<usize>,
 }
