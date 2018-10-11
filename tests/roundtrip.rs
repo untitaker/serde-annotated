@@ -1,27 +1,28 @@
 extern crate difference;
 extern crate serde_annotated;
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_json;
 
-#[macro_use] mod common;
+#[macro_use]
+mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
 
 #[derive(Serialize, Deserialize, Default, PartialEq)]
 struct Meta {
-    foo_meta: Option<usize>
+    foo_meta: Option<usize>,
 }
 
 type Annotated<T> = serde_annotated::Annotated<T, Meta>;
-
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Value {
     Map(BTreeMap<String, Annotated<Value>>),
     Array(Vec<Annotated<Value>>),
-    Primitive(serde_json::Value)
+    Primitive(serde_json::Value),
 }
 
 macro_rules! create_roundtrip_test {
@@ -31,15 +32,16 @@ macro_rules! create_roundtrip_test {
             // Read fixture and normalize formatting
             let string = serde_json::to_string_pretty(
                 &serde_json::from_str::<serde_json::Value>(
-                    &fs::read_to_string(format!("tests/roundtrip/{}.json", stringify!($filename))).unwrap()
-                ).unwrap()
+                    &fs::read_to_string(format!("tests/roundtrip/{}.json", stringify!($filename)))
+                        .unwrap(),
+                ).unwrap(),
             ).unwrap();
 
             let structured: Annotated<Value> = serde_json::from_str(&string).unwrap();
             let string2 = serde_json::to_string_pretty(&structured).unwrap();
             assert_eq_str!(string, string2);
         }
-    }
+    };
 }
 
 create_roundtrip_test!(cocoa);
